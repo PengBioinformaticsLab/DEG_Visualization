@@ -1,0 +1,11 @@
+# Install the required packages with lock versions locally before deploying.
+# Deployment command for reference
+
+
+⁠rsconnect::deployApp(
++     appDir        = "../../rna_seq_R_Shiny/DEG_GSEA",
++     appFiles      = c("app_RNA_GSEA.R", "renv-2_042226.lock"),
++     appPrimaryDoc = "app_RNA_GSEA.R",
++     appId         = 742,
++     forceUpdate   = FALSE
++ )
