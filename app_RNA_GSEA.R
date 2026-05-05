@@ -28,9 +28,9 @@ options(
   shiny.maxWebsocketMessageSize = 500 * 1024^2
 )
 
-
+# ─────────────────────────────────────────────────────────────────────────────
 # Helper functions
-
+# ─────────────────────────────────────────────────────────────────────────────
 
 # Groups always come from comparison_info in RData — no fallback needed
 extract_groups_from_comparison <- function(cmp, comparison_info = NULL) {
@@ -71,9 +71,9 @@ detect_gene_columns <- function(df) {
   )
 }
 
-
+# ─────────────────────────────────────────────────────────────────────────────
 # Species / OrgDb lookup
-
+# ─────────────────────────────────────────────────────────────────────────────
 SPECIES_MAP <- list(
   "M. musculus"   = list(OrgDb = org.Mm.eg.db, KEGGOrg = "mmu"),
   "D. rerio"      = list(OrgDb = org.Dr.eg.db, KEGGOrg = "dre"),
@@ -85,22 +85,33 @@ SPECIES_MAP <- list(
 
 # Run GSEA for one comparison (GO BP + KEGG)
 
-run_gsea_for_cmp <- function(cmp, df, gene_symbol_col, OrgDb, KEGGOrg, gsea_seed) {
+run_gsea_for_cmp <- function(cmp, df, gene_symbol_col, gene_id_col, OrgDb, KEGGOrg, gsea_seed, kegg_species = NULL) {
   logFC_col <- paste0(cmp, "_logFC")
   if (!logFC_col %in% colnames(df)) return(list(GO_BP = NULL, KEGG = NULL))
   
+  # prefer GeneSymbol, fall back to ENSEMBL if GeneSymbol is all NA
+  gsea_name_col <- if (!is.null(gene_symbol_col) &&
+                       gene_symbol_col %in% colnames(df) &&
+                       sum(!is.na(df[[gene_symbol_col]])) > 0)
+    gene_symbol_col
+  else gene_id_col
+  cat("GSEA using gene identifier:", gsea_name_col, "\n")
+  
   gene_list <- df[[logFC_col]]
-  names(gene_list) <- df[[gene_symbol_col]]
+  names(gene_list) <- df[[gsea_name_col]]
   gene_list <- na.omit(gene_list)
   gene_list <- sort(gene_list, decreasing = TRUE)
   gene_list <- gene_list[!duplicated(names(gene_list)) &
                            !is.na(names(gene_list)) & names(gene_list) != ""]
   
-  go_obj <- tryCatch({
+  # keyType depends on which identifier we are using
+  go_key_type <- if (gsea_name_col == "ENSEMBL") "ENSEMBL" else "ALIAS"
+  
+  go_bp_obj <- tryCatch({
     set.seed(gsea_seed)
     gseGO(geneList      = gene_list,
           ont           = "BP",
-          keyType       = "ALIAS",
+          keyType       = go_key_type,
           exponent      = 1,
           minGSSize     = 10,
           maxGSSize     = 500,
@@ -109,7 +120,37 @@ run_gsea_for_cmp <- function(cmp, df, gene_symbol_col, OrgDb, KEGGOrg, gsea_seed
           OrgDb         = OrgDb,
           seed          = TRUE,
           verbose       = FALSE)
-  }, error = function(e) { cat("gseGO error for", cmp, ":", e$message, "\n"); NULL })
+  }, error = function(e) { cat("gseGO BP error for", cmp, ":", e$message, "\n"); NULL })
+  
+  go_mf_obj <- tryCatch({
+    set.seed(gsea_seed)
+    gseGO(geneList      = gene_list,
+          ont           = "MF",
+          keyType       = go_key_type,
+          exponent      = 1,
+          minGSSize     = 10,
+          maxGSSize     = 500,
+          pvalueCutoff  = 1.0,
+          pAdjustMethod = "fdr",
+          OrgDb         = OrgDb,
+          seed          = TRUE,
+          verbose       = FALSE)
+  }, error = function(e) { cat("gseGO MF error for", cmp, ":", e$message, "\n"); NULL })
+  
+  go_cc_obj <- tryCatch({
+    set.seed(gsea_seed)
+    gseGO(geneList      = gene_list,
+          ont           = "CC",
+          keyType       = go_key_type,
+          exponent      = 1,
+          minGSSize     = 10,
+          maxGSSize     = 500,
+          pvalueCutoff  = 1.0,
+          pAdjustMethod = "fdr",
+          OrgDb         = OrgDb,
+          seed          = TRUE,
+          verbose       = FALSE)
+  }, error = function(e) { cat("gseGO CC error for", cmp, ":", e$message, "\n"); NULL })
   
   kegg_obj <- tryCatch({
     ids       <- bitr(names(gene_list), fromType = "ALIAS", toType = "ENTREZID",
@@ -134,16 +175,25 @@ run_gsea_for_cmp <- function(cmp, df, gene_symbol_col, OrgDb, KEGGOrg, gsea_seed
   
   make_gsea_entry <- function(gsea_obj) {
     if (is.null(gsea_obj) || nrow(gsea_obj@result) == 0) return(NULL)
-    gsea_obj@result$Description <- gsub(" - .*$", "", gsea_obj@result$Description)
+    # strip species name using exact KEGG species name passed in as parameter
+    # handles both "- Mus musculus" and "- Mus musculus (house mouse)"
+    if (!is.null(kegg_species) && nchar(kegg_species) > 0) {
+      gsea_obj@result$Description <- sub(
+        paste0(" - ", kegg_species, "(\\s*\\([^)]+\\))?$"), "",
+        gsea_obj@result$Description)
+    }
     list(gsea_object = gsea_obj, result = gsea_obj@result, gene_list = gene_list)
   }
   
-  list(GO_BP = make_gsea_entry(go_obj), KEGG = make_gsea_entry(kegg_obj))
+  list(GO_BP = make_gsea_entry(go_bp_obj),
+       GO_MF = make_gsea_entry(go_mf_obj),
+       GO_CC = make_gsea_entry(go_cc_obj),
+       KEGG  = make_gsea_entry(kegg_obj))
 }
 
-
+# ─────────────────────────────────────────────────────────────────────────────
 # Timepoint helpers
-
+# ─────────────────────────────────────────────────────────────────────────────
 is_timepoint_cmp <- function(cmp) grepl("_Timepoint$", cmp)
 
 # Gets ordered groups for a timepoint comparison from comparison_info
@@ -154,9 +204,9 @@ get_timepoint_groups <- function(cmp, sample_group_map, comparison_info) {
   return(valid)
 }
 
-
+# ─────────────────────────────────────────────────────────────────────────────
 # process_rdata
-
+# ─────────────────────────────────────────────────────────────────────────────
 process_rdata <- function(DE_output, sinfo, comparison_info, species = NULL, gsea_seed = NULL) {
   
   df <- DE_output %>% dplyr::mutate(dplyr::across(dplyr::where(is.character), trimws))
@@ -307,9 +357,9 @@ process_rdata <- function(DE_output, sinfo, comparison_info, species = NULL, gse
   )
 }
 
-
+# ─────────────────────────────────────────────────────────────────────────────
 # UI
-
+# ─────────────────────────────────────────────────────────────────────────────
 ui <- fluidPage(
   tags$head(
     tags$link(rel = "preconnect", href = "https://fonts.googleapis.com"),
@@ -429,7 +479,7 @@ ui <- fluidPage(
                                        hr(),
                                        div(class = "tab-section-title", "DEG Table \u2014 ordered by |logFC|"),
                                        div(class = "table-click-hint", "Click any row to highlight that gene on the plots above"),
-                                       downloadButton("downloadVolcanoTableCSV", "\u2193 CSV", class = "btn-dl btn-dl-csv"),
+                                       downloadButton("downloadVolcanoTableCSV", "\u2193 CSV (with log2CPM)", class = "btn-dl btn-dl-csv"),
                                        DTOutput("degTableVolcano")),
                               
                               tabPanel("Heatmap",
@@ -443,6 +493,8 @@ ui <- fluidPage(
                                        hr()),
                               
                               tabPanel("GSEA - GO BP",  uiOutput("gsea_go_content")),
+                              tabPanel("GSEA - GO MF",  uiOutput("gsea_gomf_content")),
+                              tabPanel("GSEA - GO CC",  uiOutput("gsea_gocc_content")),
                               tabPanel("GSEA - KEGG",   uiOutput("gsea_kegg_content"))
                   )
               )
@@ -631,10 +683,10 @@ server <- function(input, output, session) {
     append_log2cpm(ma_table_data(), rv$data$metadata$gene_cols)
   })
   
-  # volcano download — no log2CPM, just the stat table
+  # volcano download — now includes log2CPM as well
   volcano_download_data <- reactive({
     req(rv$data, input$cmp)
-    volcano_table_data()  # no log2CPM appended for volcano
+    append_log2cpm(volcano_table_data(), rv$data$metadata$gene_cols)
   })
   
   # ── MDS / PCA ───────────────────────────────────────────────────────────────
@@ -820,7 +872,9 @@ server <- function(input, output, session) {
     set.seed(42)
     
     make_expr_hover <- function(sample, group, expr) {
-      paste0("<b>Sample</b>: ", sample, "<br><b>Group</b>: ", group,
+      # truncate long sample names so tooltip doesn't cover other points
+      short_sample <- ifelse(nchar(sample) > 20, paste0(substr(sample, 1, 20), "..."), sample)
+      paste0("<b>Sample</b>: ", short_sample, "<br><b>Group</b>: ", group,
              "<br><b>Expression</b>: ", round(expr, 3))
     }
     
@@ -838,6 +892,9 @@ server <- function(input, output, session) {
                       HoverText = make_expr_hover(BareSample, Group, Expr))
       gene_label <- if (!is.na(expr$GeneSymbol[1]) && expr$GeneSymbol[1] != "")
         paste0(expr$GeneSymbol[1], " (", rv$gene, ")") else rv$gene
+      y_min <- min(expr$Expr, na.rm=TRUE)
+      y_max <- max(expr$Expr, na.rm=TRUE)
+      y_pad <- (y_max - y_min) * 0.4  # 40% padding below so tooltip fits under lowest point
       plot_ly(expr, x=~JitterX, y=~Expr, color=~Group,
               text=~HoverText, hoverinfo="text",
               hoveron="points",
@@ -848,7 +905,9 @@ server <- function(input, output, session) {
                           tickvals=seq_along(levels(expr$Group)),
                           ticktext=levels(expr$Group), tickangle=90,
                           zeroline=FALSE, range=c(0.3, length(levels(expr$Group))+0.7)),
-               yaxis=list(title="log2 CPM"), showlegend=TRUE,
+               yaxis=list(title="log2 CPM",
+                          range=c(y_min - y_pad, y_max + (y_max - y_min) * 0.1)),
+               showlegend=TRUE,
                hovermode="closest",
                hoverlabel=list(namelength=0, align="left"))
     } else {
@@ -874,9 +933,12 @@ server <- function(input, output, session) {
       }
       gene_label <- if (!is.na(expr$GeneSymbol[1]) && expr$GeneSymbol[1] != "")
         paste0(expr$GeneSymbol[1], " (", rv$gene, ")") else rv$gene
+      y_min <- min(expr$Expr, na.rm=TRUE)
+      y_max <- max(expr$Expr, na.rm=TRUE)
+      y_pad <- (y_max - y_min) * 0.4  # 40% padding below so tooltip fits under lowest point
       plot_ly(expr, x=~JitterNum, y=~Expr, color=~CompGroup,
               text=~HoverText, hoverinfo="text",
-              hoveron="points",           # hover only on actual dot
+              hoveron="points",
               type="scatter", mode="markers",
               marker=list(size=8, opacity=0.8, line=list(width=0.5, color="white"))) %>%
         layout(title=list(text=paste("Expression:", gene_label), font=list(size=13)),
@@ -884,7 +946,9 @@ server <- function(input, output, session) {
                           tickvals=seq_along(levels(expr$CompGroup)),
                           ticktext=levels(expr$CompGroup), tickangle=90,
                           zeroline=FALSE, range=c(0.3, length(levels(expr$CompGroup))+0.7)),
-               yaxis=list(title="log2 CPM"), showlegend=TRUE,
+               yaxis=list(title="log2 CPM",
+                          range=c(y_min - y_pad, y_max + (y_max - y_min) * 0.1)),
+               showlegend=TRUE,
                hovermode="closest",
                hoverlabel=list(namelength=0, align="left"))
     }
@@ -936,15 +1000,18 @@ server <- function(input, output, session) {
   # ── Heatmap ─────────────────────────────────────────────────────────────────
   heatmap_data <- reactive({
     req(rv$data, input$cmp)
-    fdr <- fdr_cut(); lfc <- logfc_cut()
-    gc  <- rv$data$metadata$gene_cols
-    id_col <- if (!is.null(gc$id)) gc$id else gc$symbol
+    fdr     <- fdr_cut()
+    lfc     <- logfc_cut()
+    metric  <- sig_metric()  # explicit dependency so heatmap reruns when metric changes
+    gc      <- rv$data$metadata$gene_cols
+    id_col  <- if (!is.null(gc$id)) gc$id else gc$symbol
     
-    df_raw <- rv$data$plot_data$MA[[input$cmp]]
-    degs   <- df_raw %>%
+    df_raw   <- rv$data$plot_data$MA[[input$cmp]]
+    sort_col <- if (metric == "fdr") "FDR" else "pvalue_raw"
+    degs     <- df_raw %>%
       dplyr::mutate(DEG = classify_deg(logFC, FDR, pvalue_raw, fdr, lfc)) %>%
       dplyr::filter(DEG != "nonDE" & abs(logFC) > lfc) %>%
-      dplyr::arrange(FDR) %>% head(50)
+      dplyr::arrange(.data[[sort_col]]) %>% head(50)
     validate(need(nrow(degs) > 0, paste("No significant DEGs found for:", input$cmp)))
     
     cmp_map <- rv$data$metadata$cmp_to_sample_groups[[input$cmp]]
@@ -977,8 +1044,9 @@ server <- function(input, output, session) {
     
     col_annotation <- data.frame(Group = unname(sg[colnames(mat_scaled)]),
                                  row.names = colnames(mat_scaled))
+    metric_label <- if (metric == "fdr") paste0("FDR<",fdr) else paste0("P<",fdr)
     list(mat=mat_scaled, annotation=col_annotation,
-         title=paste0("Top ",nrow(degs)," DEGs (FDR<",fdr," & |logFC|>",lfc,") \u2014 z-score: ",input$cmp))
+         title=paste0("Top ",nrow(degs)," DEGs (",metric_label," & |logFC|>",lfc,") \u2014 z-score: ",input$cmp))
   })
   
   draw_pheatmap <- function(hd) {
@@ -1005,22 +1073,23 @@ server <- function(input, output, session) {
   gsea_triggered <- reactiveVal(NULL)
   
   observeEvent(input$main_tabs, {
-    if (input$main_tabs %in% c("GSEA - GO BP", "GSEA - KEGG"))
+    if (input$main_tabs %in% c("GSEA - GO BP", "GSEA - GO MF", "GSEA - GO CC", "GSEA - KEGG"))
       gsea_triggered(input$cmp)
     else
       gsea_triggered(NULL)
   })
   
-  # only reset trigger when NOT on GSEA tab
   observeEvent(input$cmp, {
-    if (!is.null(input$main_tabs) && !input$main_tabs %in% c("GSEA - GO BP", "GSEA - KEGG"))
+    if (!is.null(input$main_tabs) && input$main_tabs %in% c("GSEA - GO BP", "GSEA - GO MF", "GSEA - GO CC", "GSEA - KEGG"))
+      gsea_triggered(input$cmp)
+    else
       gsea_triggered(NULL)
   })
   
   gsea_for_cmp <- reactive({
     cmp_trigger <- gsea_triggered()
     req(rv$data, cmp_trigger)
-    cmp      <- isolate(input$cmp)
+    cmp <- cmp_trigger  # use the comparison that triggered GSEA, not isolate(input$cmp)
     if (!is.null(rv$gsea_cache[[cmp]])) return(rv$gsea_cache[[cmp]])
     
     species   <- rv$data$metadata$species
@@ -1042,9 +1111,11 @@ server <- function(input, output, session) {
         cmp             = cmp,
         df              = rv$data$metadata$DE_df,
         gene_symbol_col = rv$data$metadata$gene_cols$symbol,
+        gene_id_col     = rv$data$metadata$gene_cols$id,
         OrgDb           = species_info$OrgDb,
         KEGGOrg         = species_info$KEGGOrg,
-        gsea_seed       = gsea_seed)
+        gsea_seed       = gsea_seed,
+        kegg_species    = species_info$kegg_species)
       incProgress(0.5, detail="Done")
     })
     
@@ -1170,7 +1241,7 @@ server <- function(input, output, session) {
                  p(style="color:#e94560;font-weight:600;font-size:14px;",
                    "\u26a0 Species not found in RData. Please ensure the RData file contains a valid species variable.")))
     tagList(
-      h4(textOutput("goTitle"), style="margin-top:8px;"), hr(),
+      hr(),
       uiOutput("goUpTitle"),
       downloadButton("downloadGoUpCSV","\u2193 CSV",class="btn-dl btn-dl-csv"),
       DTOutput("goUpregulatedTable"), hr(),
@@ -1188,6 +1259,81 @@ server <- function(input, output, session) {
     )
   })
   
+  # ── GO MF tab ────────────────────────────────────────────────────────────────
+  output$gsea_gomf_content <- renderUI({
+    req(rv$data, input$cmp)
+    if (is.null(rv$data$metadata$species) || !rv$data$metadata$species %in% names(SPECIES_MAP))
+      return(div(style="padding:20px;", p(style="color:#e94560;font-weight:600;font-size:14px;",
+                                          "\u26a0 Species not found in RData.")))
+    tagList(hr(),
+            uiOutput("gomfUpTitle"),
+            downloadButton("downloadGomfUpCSV","\u2193 CSV",class="btn-dl btn-dl-csv"),
+            DTOutput("gomfUpregulatedTable"), hr(),
+            uiOutput("gomfDownTitle"),
+            downloadButton("downloadGomfDownCSV","\u2193 CSV",class="btn-dl btn-dl-csv"),
+            DTOutput("gomfDownregulatedTable"), hr(),
+            div(class="tab-section-title","Dot Plot \u2014 significant terms only"),
+            fluidRow(column(12,
+                            downloadButton("downloadGomfDotPDF","\u2193 PDF",class="btn-dl btn-dl-pdf"),
+                            downloadButton("downloadGomfDotPNG","\u2193 PNG",class="btn-dl btn-dl-png"))),
+            plotOutput("gomfDotPlot", height="720px"), hr(),
+            div(class="tab-section-title","Enrichment Score Plots \u2014 significant terms only"),
+            uiOutput("gomfEnrichmentPlots"))
+  })
+  
+  # ── GO CC tab ────────────────────────────────────────────────────────────────
+  output$gsea_gocc_content <- renderUI({
+    req(rv$data, input$cmp)
+    if (is.null(rv$data$metadata$species) || !rv$data$metadata$species %in% names(SPECIES_MAP))
+      return(div(style="padding:20px;", p(style="color:#e94560;font-weight:600;font-size:14px;",
+                                          "\u26a0 Species not found in RData.")))
+    tagList(hr(),
+            uiOutput("goccUpTitle"),
+            downloadButton("downloadGoccUpCSV","\u2193 CSV",class="btn-dl btn-dl-csv"),
+            DTOutput("goccUpregulatedTable"), hr(),
+            uiOutput("goccDownTitle"),
+            downloadButton("downloadGoccDownCSV","\u2193 CSV",class="btn-dl btn-dl-csv"),
+            DTOutput("goccDownregulatedTable"), hr(),
+            div(class="tab-section-title","Dot Plot \u2014 significant terms only"),
+            fluidRow(column(12,
+                            downloadButton("downloadGoccDotPDF","\u2193 PDF",class="btn-dl btn-dl-pdf"),
+                            downloadButton("downloadGoccDotPNG","\u2193 PNG",class="btn-dl btn-dl-png"))),
+            plotOutput("goccDotPlot", height="720px"), hr(),
+            div(class="tab-section-title","Enrichment Score Plots \u2014 significant terms only"),
+            uiOutput("goccEnrichmentPlots"))
+  })
+  
+  output$gomfUpTitle   <- NULL
+  output$gomfDownTitle <- NULL
+  output$goccUpTitle   <- NULL
+  output$goccDownTitle <- NULL
+  
+  gomf_up_data   <- reactive({ req(rv$data,input$cmp); make_gsea_table(filter_to_genesets(gsea_for_cmp()$GO_MF), "up") })
+  gomf_down_data <- reactive({ req(rv$data,input$cmp); make_gsea_table(filter_to_genesets(gsea_for_cmp()$GO_MF), "down") })
+  gocc_up_data   <- reactive({ req(rv$data,input$cmp); make_gsea_table(filter_to_genesets(gsea_for_cmp()$GO_CC), "up") })
+  gocc_down_data <- reactive({ req(rv$data,input$cmp); make_gsea_table(filter_to_genesets(gsea_for_cmp()$GO_CC), "down") })
+  
+  output$gomfUpregulatedTable   <- renderDT({ tbl <- gomf_up_data();   dt <- datatable(tbl, rownames=FALSE, options=list(scrollX=TRUE,pageLength=20,order=list(list(2,"asc")))); if ("P value" %in% colnames(tbl)) dt <- dt %>% formatSignif(columns=c("P value","P adjusted"),digits=3); dt })
+  output$gomfDownregulatedTable <- renderDT({ tbl <- gomf_down_data(); dt <- datatable(tbl, rownames=FALSE, options=list(scrollX=TRUE,pageLength=20,order=list(list(2,"asc")))); if ("P value" %in% colnames(tbl)) dt <- dt %>% formatSignif(columns=c("P value","P adjusted"),digits=3); dt })
+  output$goccUpregulatedTable   <- renderDT({ tbl <- gocc_up_data();   dt <- datatable(tbl, rownames=FALSE, options=list(scrollX=TRUE,pageLength=20,order=list(list(2,"asc")))); if ("P value" %in% colnames(tbl)) dt <- dt %>% formatSignif(columns=c("P value","P adjusted"),digits=3); dt })
+  output$goccDownregulatedTable <- renderDT({ tbl <- gocc_down_data(); dt <- datatable(tbl, rownames=FALSE, options=list(scrollX=TRUE,pageLength=20,order=list(list(2,"asc")))); if ("P value" %in% colnames(tbl)) dt <- dt %>% formatSignif(columns=c("P value","P adjusted"),digits=3); dt })
+  
+  output$downloadGomfUpCSV   <- downloadHandler(filename=function() paste0(input$cmp,"_GOMF_up.csv"),   content=function(file) write.csv(gomf_up_data(),  file,row.names=FALSE))
+  output$downloadGomfDownCSV <- downloadHandler(filename=function() paste0(input$cmp,"_GOMF_down.csv"), content=function(file) write.csv(gomf_down_data(),file,row.names=FALSE))
+  output$downloadGoccUpCSV   <- downloadHandler(filename=function() paste0(input$cmp,"_GOCC_up.csv"),   content=function(file) write.csv(gocc_up_data(),  file,row.names=FALSE))
+  output$downloadGoccDownCSV <- downloadHandler(filename=function() paste0(input$cmp,"_GOCC_down.csv"), content=function(file) write.csv(gocc_down_data(),file,row.names=FALSE))
+  
+  output$gomfDotPlot <- renderPlot({ req(rv$data,input$cmp); p <- make_dotplot(gsea_for_cmp()$GO_MF); if (is.null(p)) no_sig_plot() else print(p) })
+  output$goccDotPlot <- renderPlot({ req(rv$data,input$cmp); p <- make_dotplot(gsea_for_cmp()$GO_CC); if (is.null(p)) no_sig_plot() else print(p) })
+  output$downloadGomfDotPDF <- downloadHandler(filename=function() paste0(input$cmp,"_GOMF_dotplot.pdf"), content=function(file) { p <- make_dotplot(gsea_for_cmp()$GO_MF); req(!is.null(p)); ggplot2::ggsave(file,plot=p,device="pdf",width=10,height=7) })
+  output$downloadGomfDotPNG <- downloadHandler(filename=function() paste0(input$cmp,"_GOMF_dotplot.png"), content=function(file) { p <- make_dotplot(gsea_for_cmp()$GO_MF); req(!is.null(p)); ggplot2::ggsave(file,plot=p,device="png",width=10,height=7,dpi=300) })
+  output$downloadGoccDotPDF <- downloadHandler(filename=function() paste0(input$cmp,"_GOCC_dotplot.pdf"), content=function(file) { p <- make_dotplot(gsea_for_cmp()$GO_CC); req(!is.null(p)); ggplot2::ggsave(file,plot=p,device="pdf",width=10,height=7) })
+  output$downloadGoccDotPNG <- downloadHandler(filename=function() paste0(input$cmp,"_GOCC_dotplot.png"), content=function(file) { p <- make_dotplot(gsea_for_cmp()$GO_CC); req(!is.null(p)); ggplot2::ggsave(file,plot=p,device="png",width=10,height=7,dpi=300) })
+  output$gomfEnrichmentPlots <- renderUI({ req(rv$data,input$cmp); render_enrichment_ui(gsea_for_cmp()$GO_MF,"gomfEnrichPlot") })
+  output$goccEnrichmentPlots <- renderUI({ req(rv$data,input$cmp); render_enrichment_ui(gsea_for_cmp()$GO_CC,"goccEnrichPlot") })
+  observe({ req(rv$data,input$cmp); render_enrichment_plots(gsea_for_cmp()$GO_MF,"gomfEnrichPlot",output,paste0(input$cmp,"_GOMF")) })
+  observe({ req(rv$data,input$cmp); render_enrichment_plots(gsea_for_cmp()$GO_CC,"goccEnrichPlot",output,paste0(input$cmp,"_GOCC")) })
+  
   # ── KEGG tab ─────────────────────────────────────────────────────────────────
   output$gsea_kegg_content <- renderUI({
     req(rv$data, input$cmp)
@@ -1196,7 +1342,7 @@ server <- function(input, output, session) {
                  p(style="color:#e94560;font-weight:600;font-size:14px;",
                    "\u26a0 Species not found in RData. Please ensure the RData file contains a valid species variable.")))
     tagList(
-      h4(textOutput("keggTitle"), style="margin-top:8px;"), hr(),
+      hr(),
       uiOutput("keggUpTitle"),
       downloadButton("downloadKeggUpCSV","\u2193 CSV",class="btn-dl btn-dl-csv"),
       DTOutput("keggUpregulatedTable"), hr(),
@@ -1224,6 +1370,10 @@ server <- function(input, output, session) {
   }
   output$goUpTitle     <- gsea_title_ui("Upregulated",   "GO BP Terms")
   output$goDownTitle   <- gsea_title_ui("Downregulated", "GO BP Terms")
+  output$gomfUpTitle   <- gsea_title_ui("Upregulated",   "GO MF Terms")
+  output$gomfDownTitle <- gsea_title_ui("Downregulated", "GO MF Terms")
+  output$goccUpTitle   <- gsea_title_ui("Upregulated",   "GO CC Terms")
+  output$goccDownTitle <- gsea_title_ui("Downregulated", "GO CC Terms")
   output$keggUpTitle   <- gsea_title_ui("Upregulated",   "KEGG Pathways")
   output$keggDownTitle <- gsea_title_ui("Downregulated", "KEGG Pathways")
   
@@ -1231,7 +1381,7 @@ server <- function(input, output, session) {
   output$goTitle <- renderText({
     req(rv$data, input$cmp)
     groups <- extract_groups_from_comparison(input$cmp, rv$data$metadata$comparison_info)
-    if (!is.null(groups) && length(groups) >= 2) paste("GO BP GSEA:", groups[1], "vs", groups[2])
+    if (!is.null(groups) && length(groups) >= 2) paste("GO BP GSEA:", groups[2], "(treatment) vs", groups[1], "(ref)")
     else paste("GO BP GSEA:", input$cmp)
   })
   
@@ -1265,7 +1415,7 @@ server <- function(input, output, session) {
   output$keggTitle <- renderText({
     req(rv$data, input$cmp)
     groups <- extract_groups_from_comparison(input$cmp, rv$data$metadata$comparison_info)
-    if (!is.null(groups) && length(groups) >= 2) paste("KEGG GSEA:", groups[1], "vs", groups[2])
+    if (!is.null(groups) && length(groups) >= 2) paste("KEGG GSEA:", groups[2], "(treatment) vs", groups[1], "(ref)")
     else paste("KEGG GSEA:", input$cmp)
   })
   
